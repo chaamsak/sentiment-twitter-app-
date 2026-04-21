@@ -1,0 +1,32 @@
+{
+  "version": "v2",
+  "negation_words": [
+    "arent",
+    "cannot",
+    "cant",
+    "didnt",
+    "doesnt",
+    "dont",
+    "hadnt",
+    "hasnt",
+    "havent",
+    "isnt",
+    "neither",
+    "never",
+    "no",
+    "nobody",
+    "none",
+    "nor",
+    "not",
+    "nothing",
+    "nowhere",
+    "shouldnt",
+    "wasnt",
+    "werent",
+    "wont",
+    "wouldnt"
+  ],
+  "negation_scope": 3,
+  "uses_lemmatization": true,
+  "description": "Negation-aware cleaning with WordNet lemmatization"
+}
