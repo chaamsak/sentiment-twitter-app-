@@ -1,35 +1,34 @@
-# Sentiment x Topic Insight Platform
+# Sentiment × Topic Insight Platform
 
-Twitter sentiment classification combined with topic discovery, deployed as a usable web app.  
-**Dataset:** Sentiment140 (1.6M tweets) — Kaggle.
+A web app that classifies short-text sentiment **and** surfaces the topics people are actually talking about — built on the 1.6M-tweet Sentiment140 dataset and deployed with Streamlit.
 
-## What this project actually is
+**Live demo:** _(add your share.streamlit.io URL here after deploying)_
 
-A two-stage pipeline that turns "people are unhappy" into **"people are unhappy about X."**
+---
 
-1. **Stage 1 — Sentiment classifier** (TF-IDF + Logistic Regression / LinearSVC)  
-   Predicts positive vs negative for any short text.
+## What this app does
 
-2. **Stage 2 — Topic discovery** (LDA + NMF, picks the more coherent one)  
-   Surfaces 10 themes from the corpus and tags each message with its dominant topic.
+Turns *"people are unhappy"* into *"people are unhappy **about X**."*
 
-3. **Stage 3 — Dashboard** (Streamlit)  
-   Crosses sentiment with topic to show **negative rate by theme** — the actionable view a real CX team would use.
+Two modes:
 
-## Honest positioning
+- **Single message** — paste a tweet, review, or feedback comment → get sentiment, confidence, and dominant topic
+- **Bulk CSV upload** — upload any text dataset → tag every row with sentiment + topic → see a sentiment × topic dashboard → download the tagged file
 
-Sentiment140 labels were auto-generated from emoticons, so classical methods plateau around **80% accuracy**. Adding topic features to TF-IDF rarely moves accuracy meaningfully because TF-IDF already captures lexical signal. **The win of this project is the insight layer, not the accuracy delta.** The notebook reports the comparison honestly and lets the dashboard carry the business value.
+A built-in 50-row sample is included so anyone can try the bulk mode without uploading their own data.
 
-## Project structure
+---
+
+## Repo structure
+
+This is the **deployment repo**. It contains only what the live app needs to run:
 
 ```
-sentiment_project/
-├── sentiment140_review1_clean.csv       # produced by Review 1 notebook (you provide)
-├── sentiment140_review2_modeling.ipynb  # this repo — modeling + topics + business layer
-├── app.py                               # Streamlit platform
-├── requirements.txt                     # for deployment
-├── README.md                            # this file
-└── artifacts/                           # produced by the notebook
+sentiment-twitter-app/
+├── app.py                  # Streamlit application
+├── requirements.txt        # Python dependencies
+├── README.md               # this file
+└── artifacts/              # trained models (produced by the research notebooks)
     ├── tfidf_vectorizer.joblib
     ├── sentiment_model.joblib
     ├── topic_vectorizer.joblib
@@ -37,53 +36,76 @@ sentiment_project/
     └── metadata.json
 ```
 
-## Setup
+The research notebooks (EDA, cleaning, model training, evaluation) live separately and are not required to run the app.
 
-### 1. Run the modeling notebook
-Open `sentiment140_review2_modeling.ipynb` in Colab or Jupyter, point it at your cleaned CSV, run all cells.  
-Expected runtime on Colab CPU: ~10–15 minutes for 200K rows.  
-Output: the `artifacts/` folder.
+---
 
-### 2. Refine topic labels (recommended)
-After the notebook prints the top words per topic, **scroll back to the labeling cell and overwrite `topic_labels[i]`** with human names like:
-```python
-topic_labels[0] = "Work & job complaints"
-topic_labels[1] = "Music & entertainment"
-```
-Re-run the labeling cell + the save-artifacts cell. Better labels = sharper dashboard.
+## Data
 
-### 3. Run the app locally
+**Training data is not included in this repo.** This repo ships only the trained model artifacts needed to serve the app.
+
+- **Dataset:** Sentiment140 (Go, Bhayani & Huang, 2009)
+- **Source:** [kaggle.com/datasets/kazanova/sentiment140](https://www.kaggle.com/datasets/kazanova/sentiment140)
+- **Size:** 1.6M tweets; this project was trained on a stratified 200K sample
+- **Labels:** auto-generated from emoticons at collection time (not human-verified)
+
+The cleaning and training code lives in the research notebooks. If you want to retrain from scratch, download the Sentiment140 CSV from Kaggle and run those notebooks to regenerate the `artifacts/` folder.
+
+---
+
+## Honest positioning
+
+Sentiment140 labels come from emoticons, not human review. Classical methods therefore plateau around **80% accuracy** on this dataset — that's a ceiling, not a failure.
+
+Adding topic features to a TF-IDF baseline rarely moves accuracy much because TF-IDF already captures most lexical signal on short text. **The point of this project is the interpretability layer**, not the accuracy delta. The notebook reports baseline-vs-enhanced honestly; the app is where the actual business value lives.
+
+---
+
+## Run the app locally
+
+Requires Python 3.10+.
+
 ```bash
+git clone <this repo URL>
+cd sentiment-twitter-app
 pip install -r requirements.txt
 streamlit run app.py
 ```
-Open http://localhost:8501.
 
-### 4. Deploy publicly (free)
-- Push this folder to a GitHub repo (include the `artifacts/` folder)
-- Go to [share.streamlit.io](https://share.streamlit.io)
-- Connect the repo, point to `app.py`, deploy
+Opens at `http://localhost:8501`.
 
-## What the app does
+---
 
-**Tab 1 — Single message:**  
-Paste a tweet/review/comment → get sentiment, confidence, dominant topic, full topic distribution.
+## Deploy for free
 
-**Tab 2 — Bulk CSV upload:**  
-Upload any CSV with a text column → tags every row → bubble-chart dashboard showing volume vs negative rate per topic → downloadable tagged CSV.
+1. Push this repo to GitHub (public)
+2. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub
+3. Click **Create app → Deploy a public app from GitHub**
+4. Select this repo, set **Main file path** to `app.py`, click **Deploy**
 
-There's also a built-in 50-row sample dataset so reviewers can demo the bulk mode without uploading anything.
+First build takes 3–5 minutes. You'll get a permanent URL you can share.
 
-## For the academic review
+---
 
-- Reproducibility: `RANDOM_STATE = 42` everywhere
-- Honest comparison: baseline vs enhanced reported with accuracy, F1, ROC-AUC
-- Two algorithms tried per task (LR vs LinearSVC for sentiment; LDA vs NMF for topics)
-- Topic coherence proxy used to pick the topic model rather than guessing
-- Test set held out from all training including topic fitting
+## Methodology summary
 
-## For the portfolio
+- **Sentiment classifier:** tested Logistic Regression vs LinearSVC on TF-IDF (1–2 grams, `min_df=5`, `sublinear_tf=True`). Winner picked by F1 on a held-out 20% test set.
+- **Topic model:** tested LDA vs NMF at 10 topics. Winner picked by a topic-coherence proxy. NMF won, consistent with literature on short text.
+- **Enhanced model:** TF-IDF matrix stacked with normalized topic distributions, refit with Logistic Regression.
+- **Reproducibility:** `RANDOM_STATE = 42` throughout; test set never touched during training.
 
-Two sentences for your CV / LinkedIn:
+---
 
-> Built an end-to-end NLP pipeline on the 1.6M-tweet Sentiment140 dataset, combining a TF-IDF + Logistic Regression sentiment classifier with NMF topic discovery to produce a sentiment×topic insight layer. Deployed as an interactive Streamlit dashboard that lets non-technical users tag any text dataset and see where negative sentiment is concentrated by theme.
+## What's next
+
+- Fine-tune DistilBERT for the sentiment classifier
+- Sentence-transformer embeddings for topic clustering
+- Scale to the full 1.6M with `HashingVectorizer` + `partial_fit`
+
+---
+
+## Citation
+
+If you use this work, please cite the original dataset:
+
+> Go, A., Bhayani, R., & Huang, L. (2009). *Twitter Sentiment Classification using Distant Supervision.* CS224N Project Report, Stanford.
