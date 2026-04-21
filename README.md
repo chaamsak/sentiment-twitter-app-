@@ -1,6 +1,6 @@
 # Sentiment × Topic Insight Platform
 
-A web app that classifies short-text sentiment **and** surfaces the topics people are actually talking about. Built on the 1.6M-tweet Sentiment140 corpus, deployed as a Streamlit app running a hybrid ML + lexicon ensemble.
+A web app that classifies short-text sentiment **and** surfaces the topics people are actually talking about. Built on the 1.6M-tweet Sentiment140 corpus, deployed as a Streamlit app running a TF-IDF + Logistic Regression classifier alongside NMF topic modeling.
 
 **Live demo:** _(add your share.streamlit.io URL here after deploying)_
 
@@ -12,7 +12,7 @@ Turns *"people are unhappy"* into *"people are unhappy **about X**."*
 
 Two modes:
 
-- **Single message** — paste a tweet, review, or feedback comment → get sentiment, confidence, dominant topic, and a per-word explanation
+- **Single message** — paste a tweet, review, or feedback comment → get sentiment, confidence, dominant topic, and a per-word explanation of the model's reasoning
 - **Bulk CSV upload** — upload any text dataset → tag every row with sentiment + topic → see a sentiment × topic dashboard → download the tagged file
 
 A built-in 50-row sample is included so anyone can try the bulk mode without uploading their own data.
@@ -21,30 +21,42 @@ A built-in 50-row sample is included so anyone can try the bulk mode without upl
 
 ## Architecture
 
-The app runs a **hybrid ensemble** of two complementary sentiment components. Both components score every input, and a deterministic decision rule picks which one drives the final prediction. Both scores are always visible in the UI so users can see which component decided and why.
+The app runs a single ML pipeline with two complementary models working together:
 
-### Component 1: ML classifier (trained)
+### Sentiment classifier
 
 - **Vectorizer:** TF-IDF with 1–2 grams, `min_df=5`, `sublinear_tf=True`, ~43K features
 - **Preprocessing (v2):** lowercase → strip URLs/mentions/HTML → drop apostrophes → negation marking with 3-token scope bounded by punctuation → WordNet lemmatization (verb form, then noun form)
-- **Classifier:** Logistic Regression (`saga` solver, `C=1.0`), selected over LinearSVC on validation-set F1
-- **Trained on:** 155K stratified Sentiment140 tweets (80% train / 10% val / 10% test, with per-user cap to prevent author-level leakage)
-- **Strengths:** handles tweet-language patterns, slang, and common sentiment vocabulary
-- **Weaknesses:** formal English (`dissatisfied`, `inadequate`) never appeared in 2009 Twitter, so the model has no signal for those words
+- **Classifier:** Logistic Regression (`saga` solver, `C=1.0`), selected over LinearSVC based on validation-set F1
+- **Trained on:** 155K stratified Sentiment140 tweets (60% train / 20% val / 20% test, with per-user cap to prevent author-level leakage)
 
-### Component 2: Lexicon analyzer (rule-based)
+### Topic model
 
-- **Library:** VADER (Valence Aware Dictionary and sEntiment Reasoner) — a hand-curated lexicon of ~7,500 sentiment-bearing words with empirically-set valence scores
-- **Strengths:** handles negation, intensifiers, and formal English natively. Reliable on clear-cut lexical cases the ML component's training corpus didn't cover
-- **Weaknesses:** can't learn domain-specific patterns, struggles with sarcasm and context-dependent sentiment
+- **Method:** NMF on TF-IDF features, 10 topics (selected over LDA based on coherence scoring)
+- **Preprocessing:** domain-specific stopword list plus content-word filtering to surface real themes instead of pronouns/fillers
+- **Topics discovered:** Work & routine, Sleep & exhaustion, Sickness, Missing friends, Music & entertainment, Love & appreciation, Weekend plans, Good wishes, Twitter activity, Home & boredom, Future plans, Sadness & loss
 
-### Ensemble decision rule
+### Explainability
 
-Both components always score the input. The lexicon takes precedence when:
-- It produces a strong signal (`|compound| ≥ 0.3`), OR
-- The ML component has fewer than 3 vocabulary matches AND the lexicon has any signal (`|compound| ≥ 0.05`)
+Every prediction in the app shows which exact words from the input pushed the score toward positive or negative, with their TF-IDF × coefficient contribution values. Users see the model's reasoning, not just its verdict.
 
-Otherwise the ML component's prediction stands. This keeps the ML component as the default path while allowing the lexicon to handle cases the ML component demonstrably can't.
+---
+
+## Honest positioning
+
+Sentiment140 labels come from emoticons, not human review. Classical ML methods therefore plateau around **80% accuracy** on this dataset — that's a ceiling, not a failure.
+
+Adding topic features to the TF-IDF baseline rarely moves accuracy much because TF-IDF already captures most lexical signal on short text. The **accuracy delta from topic features is near zero**; the value of topic modeling here is the **interpretability layer** — saying not just "this tweet is negative" but "this tweet is negative AND it's about customer service." The notebook reports baseline-vs-enhanced numbers honestly.
+
+### Known model limitations
+
+The app surfaces these honestly rather than hiding them:
+
+- **Out-of-vocabulary formal words.** Sentiment140 is 2009 Twitter language. Formal English like `dissatisfied`, `inadequate`, `unacceptable` barely appears in the training corpus, so the model has no learned signal for them. When input words don't appear in the model's vocabulary, the app shows a clear warning that the prediction is unreliable.
+- **Low-vocab inputs.** Very short or unusual messages may match only 1–2 words in the vocabulary. The app flags these with a weak-signal warning.
+- **Label noise.** Emoticon-based labels introduce 10–15% noise, which caps achievable accuracy.
+
+The next iteration would swap TF-IDF for transformer embeddings (DistilBERT), which handle OOV natively through subword tokenization.
 
 ---
 
@@ -54,7 +66,7 @@ This is the **deployment repo**. It contains only what the live app needs to run
 
 ```
 sentiment-twitter-app/
-├── app.py                       # Streamlit application (hybrid ensemble)
+├── app.py                       # Streamlit application
 ├── requirements.txt             # Python dependencies
 ├── README.md                    # this file
 └── artifacts/                   # trained models (produced by the research notebooks)
@@ -83,22 +95,12 @@ The cleaning and training code lives in the research notebooks. If you want to r
 
 ---
 
-## Honest positioning
-
-Sentiment140 labels come from emoticons, not human review. Classical ML methods therefore plateau around **80% accuracy** on this dataset — that's a ceiling, not a failure.
-
-Adding topic features to a TF-IDF baseline rarely moves accuracy much because TF-IDF already captures most lexical signal on short text. The **ML accuracy delta from topic features is near zero**; the value of topic modeling here is the **interpretability layer** — the ability to say not just "this tweet is negative" but "this tweet is negative AND it's about customer service." The notebook reports baseline-vs-enhanced numbers honestly.
-
-The **hybrid architecture** is what makes the app usable beyond the training corpus. The ML component was honest about its failure modes — formal English and unambiguous negation — so the deployed system uses the lexicon to cover them. This is a standard production pattern (ensemble with specialization), not a workaround.
-
----
-
 ## Methodology summary (research notebooks)
 
 **Preprocessing (v2 — upgraded from Review 1):**
 - Negation-aware cleaning: detect negation words, prefix next 3 tokens with `not_`, scope bounded by punctuation
 - WordNet lemmatization: `frustrated / frustrating / frustration` all collapse to `frustrate`
-- Ablation study in the notebook compares v1 (original) and v2 preprocessing with identical hyperparameters
+- Ablation study in the notebook compares v1 (original) vs v2 preprocessing with identical hyperparameters, plus a targeted evaluation on 15 curated negation/word-family cases
 
 **Sentiment classifier selection:**
 - Tested Logistic Regression and LinearSVC on TF-IDF features
@@ -116,7 +118,7 @@ The **hybrid architecture** is what makes the app usable beyond the training cor
 
 **Reproducibility:**
 - `RANDOM_STATE = 42` throughout
-- All decisions validated with measurable criteria, not inspection alone
+- All modeling decisions validated with measurable criteria, not inspection alone
 
 ---
 
@@ -148,8 +150,8 @@ First build takes 3–5 minutes (installs dependencies + downloads WordNet). You
 
 ## Next iterations
 
-- Fine-tune DistilBERT as a third ensemble component for the long tail of cases neither TF-IDF nor VADER handles well
-- Character n-gram features to improve OOV handling without leaving the classical-ML regime
+- Fine-tune DistilBERT to handle OOV words natively through subword tokenization
+- Character n-gram features as a lighter-weight path to partial OOV handling
 - Scale to the full 1.6M with `HashingVectorizer` + `partial_fit` for streaming training
 
 ---
@@ -159,7 +161,3 @@ First build takes 3–5 minutes (installs dependencies + downloads WordNet). You
 If you use this work, please cite the original dataset:
 
 > Go, A., Bhayani, R., & Huang, L. (2009). *Twitter Sentiment Classification using Distant Supervision.* CS224N Project Report, Stanford.
-
-And the VADER library:
-
-> Hutto, C.J. & Gilbert, E.E. (2014). *VADER: A Parsimonious Rule-based Model for Sentiment Analysis of Social Media Text.* Eighth International Conference on Weblogs and Social Media (ICWSM-14).
