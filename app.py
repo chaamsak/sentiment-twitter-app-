@@ -87,12 +87,75 @@ def predict_sentiment(texts, art):
 def predict_topics(cleaned_texts, art):
     Xt = art["topic_vec"].transform(cleaned_texts)
     topic_dist = art["topic_model"].transform(Xt)
-    # row-normalize
+    # Keep the RAW signal strength (how strongly NMF actually activated)
+    raw_signal = topic_dist.sum(axis=1)
+    # Row-normalize for relative comparison
     s = topic_dist.sum(axis=1, keepdims=True)
     s[s == 0] = 1
-    topic_dist = topic_dist / s
-    dominant = topic_dist.argmax(axis=1)
-    return topic_dist, dominant
+    topic_dist_norm = topic_dist / s
+    dominant = topic_dist_norm.argmax(axis=1)
+    return topic_dist_norm, dominant, raw_signal
+
+
+def explain_prediction(cleaned_text, art, top_k=5):
+    """Return the words in the input that contributed most toward positive/negative.
+
+    Works for LogisticRegression directly. For CalibratedClassifierCV (wrapping LinearSVC),
+    we pull coefficients from the calibrated base estimator.
+    """
+    X = art["tfidf"].transform([cleaned_text])
+    if X.nnz == 0:
+        return [], [], 0
+
+    model = art["model"]
+    # Extract coefficient vector
+    if hasattr(model, "coef_"):
+        coef = model.coef_[0]
+    elif hasattr(model, "calibrated_classifiers_"):
+        # CalibratedClassifierCV wraps multiple base estimators
+        coefs = [c.estimator.coef_[0] for c in model.calibrated_classifiers_
+                 if hasattr(c, "estimator") and hasattr(c.estimator, "coef_")]
+        if not coefs:
+            return [], [], X.nnz
+        coef = np.mean(coefs, axis=0)
+    else:
+        return [], [], X.nnz
+
+    # Per-feature contribution = tfidf_value * coefficient
+    feature_names = art["tfidf"].get_feature_names_out()
+    contrib = X.multiply(coef).tocsr()
+    row = contrib.getrow(0)
+    indices = row.indices
+    values = row.data
+
+    word_contribs = [(feature_names[i], float(v)) for i, v in zip(indices, values)]
+    pos_words = sorted([w for w in word_contribs if w[1] > 0], key=lambda x: -x[1])[:top_k]
+    neg_words = sorted([w for w in word_contribs if w[1] < 0], key=lambda x: x[1])[:top_k]
+    return pos_words, neg_words, X.nnz
+
+
+def explain_topic(cleaned_text, dominant_topic, art, top_k=6):
+    """Return the words in the input that pushed it into the dominant topic."""
+    topic_vec = art["topic_vec"]
+    topic_model = art["topic_model"]
+
+    Xt = topic_vec.transform([cleaned_text])
+    if Xt.nnz == 0:
+        return []
+
+    feature_names = topic_vec.get_feature_names_out()
+    topic_weights = topic_model.components_[dominant_topic]
+
+    row = Xt.getrow(0)
+    indices = row.indices
+    values = row.data
+
+    # Weight each input word by how strongly it belongs to the dominant topic
+    word_scores = [(feature_names[i], float(v * topic_weights[i]))
+                   for i, v in zip(indices, values)]
+    word_scores = [w for w in word_scores if w[1] > 0]
+    word_scores.sort(key=lambda x: -x[1])
+    return word_scores[:top_k]
 
 
 def topic_label_for(topic_id, art):
@@ -157,41 +220,139 @@ def render_single_mode(art):
             return
 
         pred, proba, cleaned = predict_sentiment([text], art)
-        topic_dist, dominant = predict_topics(cleaned, art)
+        topic_dist, dominant, raw_signal = predict_topics(cleaned, art)
         topic_id = int(dominant[0])
         topic_score = float(topic_dist[0, topic_id])
+        topic_raw = float(raw_signal[0])
 
+        pos_words, neg_words, n_features = explain_prediction(cleaned[0], art)
+        topic_words = explain_topic(cleaned[0], topic_id, art)
+
+        # ---------- Out-of-vocabulary warning ----------
+        if n_features == 0:
+            st.error(
+                "⚠️ **The model doesn't know any of these words.** "
+                "Every word in your input was below the training-frequency threshold "
+                "or didn't appear in Twitter-language training data. "
+                "The prediction below is the model's default guess, not a real analysis. "
+                "Try a longer message with common words."
+            )
+        elif n_features < 3:
+            st.warning(
+                f"⚠️ Only {n_features} word(s) from your input are in the model's vocabulary. "
+                "The prediction has low reliability. Add more context for a better result."
+            )
+
+        # ---------- Headline metrics ----------
         sentiment_label = "Positive 😊" if pred[0] == 1 else "Negative 😟"
         confidence = proba[0] if pred[0] == 1 else 1 - proba[0]
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Sentiment", sentiment_label)
-        c2.metric("Confidence", f"{confidence:.1%}")
-        c3.metric("Dominant topic", topic_label_for(topic_id, art),
-                  delta=f"{topic_score:.0%} weight")
-
-        # Topic distribution bar chart
-        st.markdown("#### Full topic distribution")
-        topic_df = pd.DataFrame({
-            "Topic": [topic_label_for(i, art) for i in range(len(topic_dist[0]))],
-            "Weight": topic_dist[0],
-        }).sort_values("Weight", ascending=False)
-
-        chart = (
-            alt.Chart(topic_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("Weight:Q", scale=alt.Scale(domain=[0, 1])),
-                y=alt.Y("Topic:N", sort="-x"),
-                color=alt.Color("Weight:Q", scale=alt.Scale(scheme="blues"), legend=None),
-                tooltip=["Topic", alt.Tooltip("Weight:Q", format=".1%")],
-            )
-            .properties(height=300)
+        c2.metric("Confidence", f"{confidence:.0%}")
+        c3.metric(
+            "Dominant topic",
+            topic_label_for(topic_id, art),
+            delta=f"signal strength: {topic_raw:.2f}",
+            delta_color="off",
         )
-        st.altair_chart(chart, use_container_width=True)
 
-        with st.expander("Cleaned text used by the model"):
+        # ---------- Explainability: why did the model predict this? ----------
+        st.markdown("---")
+        st.markdown("### 🔍 Why the model said this")
+        st.caption("Per-word contribution: how much each word in your input pushed the prediction toward positive or negative.")
+
+        if n_features == 0:
+            st.info("No explanation available — none of your input words are in the model's vocabulary.")
+        else:
+            exp_col1, exp_col2 = st.columns(2)
+
+            with exp_col1:
+                st.markdown("**🟢 Pushed toward POSITIVE**")
+                if pos_words:
+                    df_pos = pd.DataFrame(pos_words, columns=["word", "strength"])
+                    chart = (
+                        alt.Chart(df_pos)
+                        .mark_bar(color="#2E7D32")
+                        .encode(
+                            x=alt.X("strength:Q", title="Contribution"),
+                            y=alt.Y("word:N", sort="-x", title=None),
+                            tooltip=["word", alt.Tooltip("strength:Q", format=".3f")],
+                        )
+                        .properties(height=180)
+                    )
+                    st.altair_chart(chart, use_container_width=True)
+                else:
+                    st.caption("No positive-leaning words in your input.")
+
+            with exp_col2:
+                st.markdown("**🔴 Pushed toward NEGATIVE**")
+                if neg_words:
+                    df_neg = pd.DataFrame(neg_words, columns=["word", "strength"])
+                    df_neg["strength_abs"] = df_neg["strength"].abs()
+                    chart = (
+                        alt.Chart(df_neg)
+                        .mark_bar(color="#C62828")
+                        .encode(
+                            x=alt.X("strength_abs:Q", title="Contribution"),
+                            y=alt.Y("word:N", sort="-x", title=None),
+                            tooltip=["word", alt.Tooltip("strength:Q", format=".3f")],
+                        )
+                        .properties(height=180)
+                    )
+                    st.altair_chart(chart, use_container_width=True)
+                else:
+                    st.caption("No negative-leaning words in your input.")
+
+        # ---------- Topic insight ----------
+        st.markdown("---")
+        st.markdown("### 🗂️ What is this message about?")
+
+        if topic_raw < 0.05:
+            st.warning(
+                f"Weak topic signal ({topic_raw:.2f}). The input is too short or generic "
+                "for the topic model to confidently place it. The match below is the best guess "
+                "but should not be trusted."
+            )
+
+        tc1, tc2 = st.columns([1, 1])
+        with tc1:
+            st.markdown(f"**Best-match topic:** {topic_label_for(topic_id, art)}")
+            words_in_topic = art["meta"]["topic_top_words"].get(str(topic_id), [])[:6]
+            st.caption(f"Topic's defining words: {', '.join(words_in_topic)}")
+            if topic_words:
+                st.markdown("**Your words that triggered this match:**")
+                for w, score in topic_words:
+                    st.markdown(f"- `{w}` (score: {score:.2f})")
+            else:
+                st.caption("None of your words strongly match this topic's defining vocabulary.")
+
+        with tc2:
+            st.markdown("**All topic weights**")
+            topic_df = pd.DataFrame({
+                "Topic": [topic_label_for(i, art)[:25] for i in range(len(topic_dist[0]))],
+                "Weight": topic_dist[0],
+            }).sort_values("Weight", ascending=False)
+
+            chart = (
+                alt.Chart(topic_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("Weight:Q", scale=alt.Scale(domain=[0, 1])),
+                    y=alt.Y("Topic:N", sort="-x", title=None),
+                    color=alt.Color("Weight:Q", scale=alt.Scale(scheme="blues"), legend=None),
+                    tooltip=["Topic", alt.Tooltip("Weight:Q", format=".1%")],
+                )
+                .properties(height=240)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+        with st.expander("🔧 Debug: cleaned text sent to the model"):
             st.code(cleaned[0] or "(empty after cleaning)")
+            st.caption(
+                f"{n_features} word(s) matched the model's TF-IDF vocabulary. "
+                f"Raw topic signal: {topic_raw:.3f} (values below ~0.05 mean the topic model barely activated)."
+            )
 
 
 # ---------- UI: bulk mode ----------
@@ -230,7 +391,7 @@ def render_bulk_mode(art):
         with st.spinner("Scoring rows..."):
             texts = df[text_col].fillna("").astype(str).tolist()
             pred, proba, cleaned = predict_sentiment(texts, art)
-            topic_dist, dominant = predict_topics(cleaned, art)
+            topic_dist, dominant, _ = predict_topics(cleaned, art)
 
             df_out = df.copy()
             df_out["sentiment"] = ["positive" if p == 1 else "negative" for p in pred]
