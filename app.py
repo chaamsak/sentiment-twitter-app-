@@ -18,14 +18,34 @@ import streamlit as st
 import altair as alt
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
+# NLTK / WordNet — must match the v2 preprocessing used in the training notebook
+import nltk
 
-# ---------- VADER lexicon safety net ----------
+
+@st.cache_resource
+def _ensure_wordnet():
+    """Download WordNet at first app startup. Cached so it only runs once."""
+    try:
+        nltk.data.find("corpora/wordnet")
+    except LookupError:
+        nltk.download("wordnet", quiet=True)
+        nltk.download("omw-1.4", quiet=True)
+    from nltk.stem import WordNetLemmatizer
+    return WordNetLemmatizer()
+
+
+_lemmatizer = _ensure_wordnet()
+
+
+# ---------- Hybrid ensemble: VADER lexicon + ML classifier ----------
 # VADER is a rule-based sentiment analyzer built for social media. It handles:
 #   - formal English the model's TF-IDF doesn't know (dissatisfied, inadequate)
 #   - negation ("not good" -> negative, "not bad" -> positive)
 #   - intensifiers ("very bad" is stronger than "bad")
-# We use it as a first-pass safety net: if VADER gives a strong signal, we trust it.
-# Otherwise we fall back to the ML model trained on Sentiment140.
+# This app runs both components as an ensemble: if VADER gives a strong lexical signal,
+# it takes precedence (it's built specifically for social-media sentiment and is more
+# reliable on formal words). Otherwise the ML classifier, trained on 155K Sentiment140
+# tweets, handles the long tail of tweet-language patterns.
 
 VADER_STRONG_THRESHOLD = 0.3   # |compound| above this -> trust VADER over ML
 VADER_WEAK_THRESHOLD = 0.05    # |compound| below this -> VADER is uncertain, use ML
@@ -106,15 +126,54 @@ REQUIRED_FILES = [
 
 
 # ---------- Cleaning function (matches Review 1) ----------
+# ---------- Preprocessing v2 — MUST match the training notebook exactly ----------
+# The model was trained on text cleaned this way. If the app cleans differently,
+# features won't align and predictions will be garbage.
+
+NEGATION_WORDS = frozenset({
+    "not", "no", "never", "nothing", "nobody", "nowhere", "neither",
+    "nor", "none", "cant", "cannot", "dont", "doesnt", "didnt",
+    "wont", "wouldnt", "shouldnt", "isnt", "arent", "wasnt", "werent",
+    "havent", "hasnt", "hadnt"
+})
+NEGATION_SCOPE = 3
+
+
 def clean_tweet(text: str) -> str:
-    text = str(text).lower()
+    """Negation-aware lemmatizing cleaner — mirrors clean_text_v2 in the notebook.
+
+    Pipeline:
+      1. Lowercase, strip URLs/mentions/HTML, drop apostrophes
+      2. Keep only letters + sentence-ending punctuation (so we can scope negation by clause)
+      3. For each clause: detect negation words, prefix the next 3 tokens with not_
+      4. Lemmatize (verb form first, then noun form)
+    """
+    if not isinstance(text, str):
+        return ""
+
+    text = text.lower()
     text = re.sub(r"http\S+|www\.\S+", " ", text)
     text = re.sub(r"@\w+", " ", text)
     text = re.sub(r"&\w+;", " ", text)
-    text = text.replace("#", "").replace("'", "")
-    text = re.sub(r"[^a-z\s]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    text = text.replace("'", "")
+    text = re.sub(r"[^a-z\s.!?,;:]", " ", text)
+
+    output_tokens = []
+    for clause in re.split(r"[.!?,;:]", text):
+        tokens = clause.split()
+        negate_until = -1
+        for i, tok in enumerate(tokens):
+            if tok in NEGATION_WORDS:
+                negate_until = i + NEGATION_SCOPE
+                continue
+            lem = _lemmatizer.lemmatize(tok, pos="v")
+            lem = _lemmatizer.lemmatize(lem, pos="n")
+            if i <= negate_until:
+                output_tokens.append("not_" + lem)
+            else:
+                output_tokens.append(lem)
+
+    return " ".join(output_tokens)
 
 
 # ---------- Artifact loading ----------
@@ -230,29 +289,33 @@ def render_sidebar(art):
     if art is not None:
         meta = art["meta"]
         st.sidebar.markdown("---")
-        st.sidebar.markdown("### How predictions work")
+        st.sidebar.markdown("### Hybrid Architecture")
         st.sidebar.markdown(
-            "**Hybrid engine.** Every prediction first runs through **VADER** — a "
-            "rule-based sentiment lexicon built for social media that handles "
-            "negation, intensifiers, and formal English. If VADER has a strong "
-            "opinion, we trust it. Otherwise we fall back to the **ML model** "
-            "trained on Sentiment140."
+            "This app runs an **ensemble** of two complementary sentiment components:\n\n"
+            "**1. ML classifier** — TF-IDF + Logistic Regression trained on Sentiment140. "
+            "Learns tweet-language patterns statistically from 155K training examples.\n\n"
+            "**2. Lexicon analyzer (VADER)** — rule-based, handles negation and formal "
+            "English that the training corpus didn't contain.\n\n"
+            "For each input, both components score it. The lexicon takes precedence when "
+            "its signal is strong; the ML component handles everything else. Both scores "
+            "are always visible so you can see which component decided and why."
         )
 
         st.sidebar.markdown("---")
-        st.sidebar.markdown("### ML Model")
-        st.sidebar.markdown(f"**Sentiment:** {meta['baseline_model_name']}")
-        st.sidebar.markdown(f"**Topics:** {meta['topic_model_name']} ({meta['n_topics']} topics)")
+        st.sidebar.markdown("### ML Component Details")
+        st.sidebar.markdown(f"**Classifier:** {meta['baseline_model_name']}")
+        st.sidebar.markdown(f"**Topic model:** {meta['topic_model_name']} ({meta['n_topics']} topics)")
 
         st.sidebar.markdown("---")
-        st.sidebar.markdown("### Test set performance (ML only)")
+        st.sidebar.markdown("### ML Test Set Performance")
+        st.sidebar.caption("Measured on held-out 20% test set. Ensemble performance would be higher.")
         m = meta["metrics"]
         st.sidebar.metric("Baseline F1", f"{m['baseline_f1']:.3f}")
         st.sidebar.metric("Enhanced F1", f"{m['enhanced_f1']:.3f}",
                           delta=f"{(m['enhanced_f1'] - m['baseline_f1']):+.3f}")
 
         st.sidebar.markdown("---")
-        st.sidebar.markdown("### Topics discovered")
+        st.sidebar.markdown("### Topics Discovered")
         for tid, label in meta["topic_labels"].items():
             with st.sidebar.expander(f"Topic {tid}: {label[:30]}"):
                 words = meta["topic_top_words"].get(str(tid), [])
@@ -298,19 +361,21 @@ def render_single_mode(art):
         pos_words, neg_words, n_features = explain_prediction(cleaned[0], art)
         topic_words = explain_topic(cleaned[0], topic_id, art)
 
-        # ---------- Hybrid engine banner — shows which engine decided ----------
+        # ---------- Hybrid engine banner — reframes both engines as ensemble components ----------
         if source == "VADER":
             st.info(
-                f"🛟 **Lexicon safety net used.** VADER detected strong sentiment "
-                f"(compound score {vader_compound:+.2f}) and overrode the ML model. "
-                f"The ML model would have said {('positive' if ml_proba >= 0.5 else 'negative')} "
-                f"at {max(ml_proba, 1-ml_proba):.0%} confidence — but it only knows words it "
-                f"saw during training, so we trust VADER for clear-cut cases like this."
+                f"**Lexicon component decided.** The rule-based sentiment analyzer (VADER) "
+                f"detected a clear lexical signal (compound score {vader_compound:+.2f}). "
+                f"For transparency, the ML component would have predicted "
+                f"{('positive' if ml_proba >= 0.5 else 'negative')} at {max(ml_proba, 1-ml_proba):.0%} confidence. "
+                f"In this hybrid ensemble, the lexicon takes precedence when it has strong signal, "
+                f"because it handles formal English and negation that the ML component's training corpus didn't cover."
             )
         else:
             st.success(
-                f"🤖 **ML model used.** VADER had no strong opinion (compound {vader_compound:+.2f}), "
-                f"so the decision came from the Sentiment140-trained classifier."
+                f"**ML component decided.** The Sentiment140-trained classifier made the call "
+                f"(lexicon compound {vader_compound:+.2f} was below the override threshold). "
+                f"This is the default path — the ML component handles the long tail of tweet-language sentiment."
             )
 
         # ---------- Out-of-vocabulary note (only if ML was used and no features matched) ----------
