@@ -1,6 +1,7 @@
 """
 Sentiment + Topic Insight Platform
-Live demo of the Sentiment140 sentiment classifier enhanced with topic discovery.
+ML-only version: TF-IDF + Logistic Regression classifier trained on Sentiment140,
+combined with NMF topic modeling for business insight.
 
 Run locally:    streamlit run app.py
 Deploy free:    https://share.streamlit.io
@@ -16,7 +17,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # NLTK / WordNet — must match the v2 preprocessing used in the training notebook
 import nltk
@@ -37,82 +37,13 @@ def _ensure_wordnet():
 _lemmatizer = _ensure_wordnet()
 
 
-# ---------- Hybrid ensemble: VADER lexicon + ML classifier ----------
-# VADER is a rule-based sentiment analyzer built for social media. It handles:
-#   - formal English the model's TF-IDF doesn't know (dissatisfied, inadequate)
-#   - negation ("not good" -> negative, "not bad" -> positive)
-#   - intensifiers ("very bad" is stronger than "bad")
-# This app runs both components as an ensemble: if VADER gives a strong lexical signal,
-# it takes precedence (it's built specifically for social-media sentiment and is more
-# reliable on formal words). Otherwise the ML classifier, trained on 155K Sentiment140
-# tweets, handles the long tail of tweet-language patterns.
-
-VADER_STRONG_THRESHOLD = 0.3   # |compound| above this -> trust VADER over ML
-VADER_WEAK_THRESHOLD = 0.05    # |compound| below this -> VADER is uncertain, use ML
-ML_MIN_VOCAB_FEATURES = 3      # below this, ML can't meaningfully predict — prefer VADER
-
-
-@st.cache_resource
-def get_vader():
-    return SentimentIntensityAnalyzer()
-
-
-def hybrid_predict(text, art, vader):
-    """Two-stage sentiment prediction:
-       1) VADER checks for lexical sentiment + handles negation
-       2) ML model handles the long tail of informal tweet patterns
-
-    Decision logic:
-      - Strong VADER signal (|compound| >= 0.3) -> trust VADER
-      - ML has few vocabulary matches (<3) AND VADER has any signal (|compound| > 0.05) -> trust VADER
-      - Otherwise -> trust ML
-
-    Returns: (pred, confidence, source, vader_compound, ml_proba, cleaned_text)
-    """
-    # VADER runs on the RAW text (it uses punctuation, capitals, etc. as signal)
-    v = vader.polarity_scores(text)
-    compound = v["compound"]
-
-    # Always compute the ML prediction too — we show both in the UI for transparency
-    cleaned = clean_tweet(text)
-    X = art["tfidf"].transform([cleaned])
-    ml_n_features = int(X.nnz)
-
-    if hasattr(art["model"], "predict_proba"):
-        ml_proba = float(art["model"].predict_proba(X)[0, 1])
-    else:
-        decision = float(art["model"].decision_function(X)[0])
-        ml_proba = float(1.0 / (1.0 + np.exp(-decision)))
-
-    # Decision rules (in order of priority)
-    use_vader = False
-    if abs(compound) >= VADER_STRONG_THRESHOLD:
-        # Rule 1: VADER has a strong opinion — trust it
-        use_vader = True
-    elif ml_n_features < ML_MIN_VOCAB_FEATURES and abs(compound) >= VADER_WEAK_THRESHOLD:
-        # Rule 2: ML has almost no vocabulary coverage AND VADER has any signal — trust VADER
-        use_vader = True
-
-    if use_vader:
-        pred = 1 if compound > 0 else 0
-        # Map compound magnitude to confidence:
-        # |compound|=0.3 -> 65% confidence; |compound|=1.0 -> 100% confidence
-        confidence = 0.5 + abs(compound) * 0.5
-        source = "VADER"
-    else:
-        pred = 1 if ml_proba >= 0.5 else 0
-        confidence = ml_proba if pred == 1 else 1 - ml_proba
-        source = "ML"
-
-    return pred, confidence, source, compound, ml_proba, cleaned
-
-
 # ---------- Page config ----------
 st.set_page_config(
     page_title="Sentiment x Topic Insight",
     page_icon="💬",
     layout="wide",
 )
+
 
 # ---------- Constants ----------
 ARTIFACTS_DIR = Path("artifacts")
@@ -125,7 +56,6 @@ REQUIRED_FILES = [
 ]
 
 
-# ---------- Cleaning function (matches Review 1) ----------
 # ---------- Preprocessing v2 — MUST match the training notebook exactly ----------
 # The model was trained on text cleaned this way. If the app cleans differently,
 # features won't align and predictions will be garbage.
@@ -200,12 +130,25 @@ def load_artifacts():
 
 
 # ---------- Prediction helpers ----------
+def predict_sentiment(texts, art):
+    """Run the ML classifier. Returns predictions, probabilities, cleaned texts, feature counts."""
+    cleaned = [clean_tweet(t) for t in texts]
+    X = art["tfidf"].transform(cleaned)
+    feature_counts = np.asarray((X != 0).sum(axis=1)).ravel().astype(int)
+
+    if hasattr(art["model"], "predict_proba"):
+        proba = art["model"].predict_proba(X)[:, 1]
+    else:
+        decision = art["model"].decision_function(X)
+        proba = 1.0 / (1.0 + np.exp(-decision))
+    pred = (proba >= 0.5).astype(int)
+    return pred, proba, cleaned, feature_counts
+
+
 def predict_topics(cleaned_texts, art):
     Xt = art["topic_vec"].transform(cleaned_texts)
     topic_dist = art["topic_model"].transform(Xt)
-    # Keep the RAW signal strength (how strongly NMF actually activated)
     raw_signal = topic_dist.sum(axis=1)
-    # Row-normalize for relative comparison
     s = topic_dist.sum(axis=1, keepdims=True)
     s[s == 0] = 1
     topic_dist_norm = topic_dist / s
@@ -214,21 +157,15 @@ def predict_topics(cleaned_texts, art):
 
 
 def explain_prediction(cleaned_text, art, top_k=5):
-    """Return the words in the input that contributed most toward positive/negative.
-
-    Works for LogisticRegression directly. For CalibratedClassifierCV (wrapping LinearSVC),
-    we pull coefficients from the calibrated base estimator.
-    """
+    """Return the words in the input that contributed most toward positive/negative."""
     X = art["tfidf"].transform([cleaned_text])
     if X.nnz == 0:
         return [], [], 0
 
     model = art["model"]
-    # Extract coefficient vector
     if hasattr(model, "coef_"):
         coef = model.coef_[0]
     elif hasattr(model, "calibrated_classifiers_"):
-        # CalibratedClassifierCV wraps multiple base estimators
         coefs = [c.estimator.coef_[0] for c in model.calibrated_classifiers_
                  if hasattr(c, "estimator") and hasattr(c.estimator, "coef_")]
         if not coefs:
@@ -237,7 +174,6 @@ def explain_prediction(cleaned_text, art, top_k=5):
     else:
         return [], [], X.nnz
 
-    # Per-feature contribution = tfidf_value * coefficient
     feature_names = art["tfidf"].get_feature_names_out()
     contrib = X.multiply(coef).tocsr()
     row = contrib.getrow(0)
@@ -266,7 +202,6 @@ def explain_topic(cleaned_text, dominant_topic, art, top_k=6):
     indices = row.indices
     values = row.data
 
-    # Weight each input word by how strongly it belongs to the dominant topic
     word_scores = [(feature_names[i], float(v * topic_weights[i]))
                    for i, v in zip(indices, values)]
     word_scores = [w for w in word_scores if w[1] > 0]
@@ -289,26 +224,17 @@ def render_sidebar(art):
     if art is not None:
         meta = art["meta"]
         st.sidebar.markdown("---")
-        st.sidebar.markdown("### Hybrid Architecture")
+        st.sidebar.markdown("### Model")
+        st.sidebar.markdown(f"**Classifier:** {meta['baseline_model_name']}")
+        st.sidebar.markdown(f"**Topic model:** {meta['topic_model_name']} ({meta['n_topics']} topics)")
         st.sidebar.markdown(
-            "This app runs an **ensemble** of two complementary sentiment components:\n\n"
-            "**1. ML classifier** — TF-IDF + Logistic Regression trained on Sentiment140. "
-            "Learns tweet-language patterns statistically from 155K training examples.\n\n"
-            "**2. Lexicon analyzer (VADER)** — rule-based, handles negation and formal "
-            "English that the training corpus didn't contain.\n\n"
-            "For each input, both components score it. The lexicon takes precedence when "
-            "its signal is strong; the ML component handles everything else. Both scores "
-            "are always visible so you can see which component decided and why."
+            "**Preprocessing:** negation-aware cleaning + WordNet lemmatization "
+            "(see the research notebook for the ablation study)."
         )
 
         st.sidebar.markdown("---")
-        st.sidebar.markdown("### ML Component Details")
-        st.sidebar.markdown(f"**Classifier:** {meta['baseline_model_name']}")
-        st.sidebar.markdown(f"**Topic model:** {meta['topic_model_name']} ({meta['n_topics']} topics)")
-
-        st.sidebar.markdown("---")
-        st.sidebar.markdown("### ML Test Set Performance")
-        st.sidebar.caption("Measured on held-out 20% test set. Ensemble performance would be higher.")
+        st.sidebar.markdown("### Test Set Performance")
+        st.sidebar.caption("Measured on held-out 20% test set, untouched during training.")
         m = meta["metrics"]
         st.sidebar.metric("Baseline F1", f"{m['baseline_f1']:.3f}")
         st.sidebar.metric("Enhanced F1", f"{m['enhanced_f1']:.3f}",
@@ -349,92 +275,53 @@ def render_single_mode(art):
             st.warning("Type or pick a message first.")
             return
 
-        vader = get_vader()
-        pred_int, confidence, source, vader_compound, ml_proba, cleaned_text = hybrid_predict(text, art, vader)
-        cleaned = [cleaned_text]  # downstream functions expect a list
+        pred, proba, cleaned, n_feat_arr = predict_sentiment([text], art)
+        n_features = int(n_feat_arr[0])
+        ml_proba = float(proba[0])
+        pred_int = int(pred[0])
 
         topic_dist, dominant, raw_signal = predict_topics(cleaned, art)
         topic_id = int(dominant[0])
-        topic_score = float(topic_dist[0, topic_id])
         topic_raw = float(raw_signal[0])
 
-        pos_words, neg_words, n_features = explain_prediction(cleaned[0], art)
+        pos_words, neg_words, _ = explain_prediction(cleaned[0], art)
         topic_words = explain_topic(cleaned[0], topic_id, art)
 
-        # ---------- Hybrid engine banner — reframes both engines as ensemble components ----------
-        if source == "VADER":
-            st.info(
-                f"**Lexicon component decided.** The rule-based sentiment analyzer (VADER) "
-                f"detected a clear lexical signal (compound score {vader_compound:+.2f}). "
-                f"For transparency, the ML component would have predicted "
-                f"{('positive' if ml_proba >= 0.5 else 'negative')} at {max(ml_proba, 1-ml_proba):.0%} confidence. "
-                f"In this hybrid ensemble, the lexicon takes precedence when it has strong signal, "
-                f"because it handles formal English and negation that the ML component's training corpus didn't cover."
-            )
-        else:
-            st.success(
-                f"**ML component decided.** The Sentiment140-trained classifier made the call "
-                f"(lexicon compound {vader_compound:+.2f} was below the override threshold). "
-                f"This is the default path — the ML component handles the long tail of tweet-language sentiment."
-            )
-
-        # ---------- Out-of-vocabulary note (only if ML was used and no features matched) ----------
-        if source == "ML" and n_features == 0:
+        # ---------- Out-of-vocabulary warning (honest about model limits) ----------
+        if n_features == 0:
             st.error(
-                "⚠️ **The ML model also doesn't know any of these words.** "
-                "VADER couldn't find clear sentiment either. The prediction below is "
-                "essentially a default guess. Try a longer message."
+                "⚠️ **The model doesn't know any of these words.** Every word in your input was "
+                "either below the training-frequency threshold or didn't appear in the Sentiment140 "
+                "training corpus (2009 Twitter language). The prediction below is a fallback guess "
+                "based on the model's intercept term, not a real analysis. "
+                "Try a longer message or tweet-like language."
             )
-        elif source == "ML" and n_features < 3:
+        elif n_features < 3:
             st.warning(
-                f"Only {n_features} word(s) matched the ML vocabulary. Low reliability."
+                f"⚠️ Only {n_features} word(s) from your input are in the model's vocabulary. "
+                "The prediction has low reliability — consider this a weak signal."
             )
 
         # ---------- Headline metrics ----------
         sentiment_label = "Positive 😊" if pred_int == 1 else "Negative 😟"
+        confidence = ml_proba if pred_int == 1 else 1 - ml_proba
 
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         c1.metric("Sentiment", sentiment_label)
         c2.metric("Confidence", f"{confidence:.0%}")
-        c3.metric("Engine", source)
-        c4.metric(
+        c3.metric(
             "Dominant topic",
             topic_label_for(topic_id, art),
             delta=f"signal: {topic_raw:.2f}",
             delta_color="off",
         )
 
-        # ---------- Engine breakdown ----------
-        with st.expander("🔬 See how each engine scored this"):
-            bc1, bc2 = st.columns(2)
-            with bc1:
-                st.markdown("**VADER (lexicon-based)**")
-                st.metric("Compound score", f"{vader_compound:+.3f}",
-                          help="Range: -1 (very negative) to +1 (very positive). |score| > 0.5 = strong.")
-                if abs(vader_compound) >= VADER_STRONG_THRESHOLD:
-                    st.caption("✅ Strong enough to decide")
-                else:
-                    st.caption("⚪ Too weak to decide alone")
-            with bc2:
-                st.markdown("**ML model (Sentiment140)**")
-                st.metric("Positive probability", f"{ml_proba:.1%}")
-                if n_features == 0:
-                    st.caption("❌ 0 words in vocabulary")
-                elif n_features < 3:
-                    st.caption(f"⚠️ Only {n_features} words in vocabulary")
-                else:
-                    st.caption(f"✅ {n_features} words in vocabulary")
-
-        # Keep the original pred variable name compatible with the rest of the function
-        pred = np.array([pred_int])
-        proba = np.array([ml_proba])  # for the explainability section below, we use ML internals
-
-        # ---------- Explainability: why did the ML model say what it said? ----------
+        # ---------- Explainability: why did the model say what it said? ----------
         st.markdown("---")
-        st.markdown("### 🔍 Why the ML model said what it said")
+        st.markdown("### 🔍 Why the model said this")
         st.caption(
-            "Per-word contribution from the Sentiment140 classifier. Note: if VADER "
-            "overrode the ML model above, the final answer is based on VADER, not these words."
+            "Per-word contribution: how much each word in your cleaned input pushed the "
+            "prediction toward positive or negative. These are the exact features the model used."
         )
 
         if n_features == 0:
@@ -526,7 +413,8 @@ def render_single_mode(art):
             st.code(cleaned[0] or "(empty after cleaning)")
             st.caption(
                 f"{n_features} word(s) matched the model's TF-IDF vocabulary. "
-                f"Raw topic signal: {topic_raw:.3f} (values below ~0.05 mean the topic model barely activated)."
+                f"Raw topic signal: {topic_raw:.3f} (values below ~0.05 mean the topic model barely activated). "
+                f"Note: `not_` prefixes mark words inside a negation scope (e.g., 'not_good')."
             )
 
 
@@ -563,25 +451,15 @@ def render_bulk_mode(art):
         return
 
     if st.button("Run analysis", type="primary"):
-        with st.spinner("Scoring rows with VADER + ML hybrid..."):
-            vader = get_vader()
+        with st.spinner("Scoring rows with ML classifier..."):
             texts = df[text_col].fillna("").astype(str).tolist()
-
-            preds, confs, sources, cleaned_list = [], [], [], []
-            for t in texts:
-                p, c, src, _, _, cl = hybrid_predict(t, art, vader)
-                preds.append(p)
-                confs.append(c)
-                sources.append(src)
-                cleaned_list.append(cl)
-
-            preds = np.array(preds)
+            pred, proba, cleaned_list, feat_counts = predict_sentiment(texts, art)
             topic_dist, dominant, _ = predict_topics(cleaned_list, art)
 
             df_out = df.copy()
-            df_out["sentiment"] = ["positive" if p == 1 else "negative" for p in preds]
-            df_out["confidence"] = np.round(confs, 3)
-            df_out["engine"] = sources
+            df_out["sentiment"] = ["positive" if p == 1 else "negative" for p in pred]
+            df_out["confidence"] = np.round(np.where(pred == 1, proba, 1 - proba), 3)
+            df_out["vocab_matched"] = feat_counts
             df_out["topic_id"] = dominant
             df_out["topic_label"] = [topic_label_for(int(t), art) for t in dominant]
 
@@ -597,18 +475,17 @@ def _render_bulk_dashboard(df_out, art):
     n_neg = int((df_out["sentiment"] == "negative").sum())
     pct_neg = n_neg / n if n else 0
     n_topics_seen = df_out["topic_id"].nunique()
-    n_vader = int((df_out["engine"] == "VADER").sum()) if "engine" in df_out.columns else 0
-    pct_vader = n_vader / n if n else 0
+    n_low_vocab = int((df_out["vocab_matched"] < 3).sum()) if "vocab_matched" in df_out.columns else 0
 
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Messages analyzed", f"{n:,}")
     k2.metric("Negative", f"{n_neg:,}", delta=f"{pct_neg:.1%}")
     k3.metric("Positive", f"{n - n_neg:,}", delta=f"{1 - pct_neg:.1%}")
     k4.metric("Distinct topics", n_topics_seen)
-    k5.metric("Decided by VADER", f"{n_vader:,}",
-              delta=f"{pct_vader:.0%} of rows",
+    k5.metric("Low-vocab rows", f"{n_low_vocab:,}",
+              delta=f"{(n_low_vocab/n if n else 0):.0%} of rows",
               delta_color="off",
-              help="VADER handled rows with clear lexical sentiment. The rest went to the ML model.")
+              help="Rows with fewer than 3 words matching the model's vocabulary. Treat their predictions with caution.")
 
     # Topic-level summary
     summary = (
@@ -622,7 +499,6 @@ def _render_bulk_dashboard(df_out, art):
         .sort_values("negative_rate", ascending=False)
     )
 
-    # Bubble chart — the headline visual
     st.markdown("#### Where customers are unhappy")
     st.caption("Each bubble is a topic. Higher = more negative. Larger = more volume. Hot spots are top-right.")
     bubble = (
@@ -649,7 +525,6 @@ def _render_bulk_dashboard(df_out, art):
             y="negative_rate:Q",
             text=alt.Text("topic_label:N"),
         )
-        .transform_calculate(short_label="slice(datum.topic_label, 0, 25)")
     )
     st.altair_chart(bubble + text_overlay, use_container_width=True)
 
@@ -673,7 +548,8 @@ def _render_bulk_dashboard(df_out, art):
     drill = df_out[df_out["topic_label"] == chosen].copy()
     neg_first = drill.sort_values("sentiment").head(20)
     st.dataframe(
-        neg_first[["sentiment", "confidence", "topic_label"] + [c for c in df_out.columns if c not in ("sentiment", "confidence", "topic_id", "topic_label")]],
+        neg_first[["sentiment", "confidence", "topic_label"] +
+                  [c for c in df_out.columns if c not in ("sentiment", "confidence", "topic_id", "topic_label")]],
         use_container_width=True,
         hide_index=True,
     )
@@ -776,10 +652,10 @@ def main():
 
     st.markdown("---")
     st.caption(
-        "This app combines a rule-based lexicon (VADER) with a Sentiment140-trained "
-        "ML classifier. VADER catches formal and negated language the ML model misses; "
-        "the ML model handles the long tail of informal tweet patterns. The sentiment × "
-        "topic dashboard is where the business insight lives — not in raw accuracy."
+        "Note: Sentiment140 labels were generated from emoticons, so classical ML accuracy "
+        "plateaus around 80% on this dataset. The strength of this project is the "
+        "sentiment × topic insight layer and the methodology rigor in the research notebook, "
+        "not raw accuracy."
     )
 
 
