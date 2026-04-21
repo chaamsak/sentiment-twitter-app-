@@ -16,6 +16,76 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+
+# ---------- VADER lexicon safety net ----------
+# VADER is a rule-based sentiment analyzer built for social media. It handles:
+#   - formal English the model's TF-IDF doesn't know (dissatisfied, inadequate)
+#   - negation ("not good" -> negative, "not bad" -> positive)
+#   - intensifiers ("very bad" is stronger than "bad")
+# We use it as a first-pass safety net: if VADER gives a strong signal, we trust it.
+# Otherwise we fall back to the ML model trained on Sentiment140.
+
+VADER_STRONG_THRESHOLD = 0.3   # |compound| above this -> trust VADER over ML
+VADER_WEAK_THRESHOLD = 0.05    # |compound| below this -> VADER is uncertain, use ML
+ML_MIN_VOCAB_FEATURES = 3      # below this, ML can't meaningfully predict — prefer VADER
+
+
+@st.cache_resource
+def get_vader():
+    return SentimentIntensityAnalyzer()
+
+
+def hybrid_predict(text, art, vader):
+    """Two-stage sentiment prediction:
+       1) VADER checks for lexical sentiment + handles negation
+       2) ML model handles the long tail of informal tweet patterns
+
+    Decision logic:
+      - Strong VADER signal (|compound| >= 0.3) -> trust VADER
+      - ML has few vocabulary matches (<3) AND VADER has any signal (|compound| > 0.05) -> trust VADER
+      - Otherwise -> trust ML
+
+    Returns: (pred, confidence, source, vader_compound, ml_proba, cleaned_text)
+    """
+    # VADER runs on the RAW text (it uses punctuation, capitals, etc. as signal)
+    v = vader.polarity_scores(text)
+    compound = v["compound"]
+
+    # Always compute the ML prediction too — we show both in the UI for transparency
+    cleaned = clean_tweet(text)
+    X = art["tfidf"].transform([cleaned])
+    ml_n_features = int(X.nnz)
+
+    if hasattr(art["model"], "predict_proba"):
+        ml_proba = float(art["model"].predict_proba(X)[0, 1])
+    else:
+        decision = float(art["model"].decision_function(X)[0])
+        ml_proba = float(1.0 / (1.0 + np.exp(-decision)))
+
+    # Decision rules (in order of priority)
+    use_vader = False
+    if abs(compound) >= VADER_STRONG_THRESHOLD:
+        # Rule 1: VADER has a strong opinion — trust it
+        use_vader = True
+    elif ml_n_features < ML_MIN_VOCAB_FEATURES and abs(compound) >= VADER_WEAK_THRESHOLD:
+        # Rule 2: ML has almost no vocabulary coverage AND VADER has any signal — trust VADER
+        use_vader = True
+
+    if use_vader:
+        pred = 1 if compound > 0 else 0
+        # Map compound magnitude to confidence:
+        # |compound|=0.3 -> 65% confidence; |compound|=1.0 -> 100% confidence
+        confidence = 0.5 + abs(compound) * 0.5
+        source = "VADER"
+    else:
+        pred = 1 if ml_proba >= 0.5 else 0
+        confidence = ml_proba if pred == 1 else 1 - ml_proba
+        source = "ML"
+
+    return pred, confidence, source, compound, ml_proba, cleaned
+
 
 # ---------- Page config ----------
 st.set_page_config(
@@ -71,19 +141,6 @@ def load_artifacts():
 
 
 # ---------- Prediction helpers ----------
-def predict_sentiment(texts, art):
-    cleaned = [clean_tweet(t) for t in texts]
-    X = art["tfidf"].transform(cleaned)
-    if hasattr(art["model"], "predict_proba"):
-        proba = art["model"].predict_proba(X)[:, 1]
-    else:
-        # fallback for raw LinearSVC — use decision function squashed
-        decision = art["model"].decision_function(X)
-        proba = 1.0 / (1.0 + np.exp(-decision))
-    pred = (proba >= 0.5).astype(int)
-    return pred, proba, cleaned
-
-
 def predict_topics(cleaned_texts, art):
     Xt = art["topic_vec"].transform(cleaned_texts)
     topic_dist = art["topic_model"].transform(Xt)
@@ -173,12 +230,22 @@ def render_sidebar(art):
     if art is not None:
         meta = art["meta"]
         st.sidebar.markdown("---")
-        st.sidebar.markdown("### Model")
+        st.sidebar.markdown("### How predictions work")
+        st.sidebar.markdown(
+            "**Hybrid engine.** Every prediction first runs through **VADER** — a "
+            "rule-based sentiment lexicon built for social media that handles "
+            "negation, intensifiers, and formal English. If VADER has a strong "
+            "opinion, we trust it. Otherwise we fall back to the **ML model** "
+            "trained on Sentiment140."
+        )
+
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("### ML Model")
         st.sidebar.markdown(f"**Sentiment:** {meta['baseline_model_name']}")
         st.sidebar.markdown(f"**Topics:** {meta['topic_model_name']} ({meta['n_topics']} topics)")
 
         st.sidebar.markdown("---")
-        st.sidebar.markdown("### Test set performance")
+        st.sidebar.markdown("### Test set performance (ML only)")
         m = meta["metrics"]
         st.sidebar.metric("Baseline F1", f"{m['baseline_f1']:.3f}")
         st.sidebar.metric("Enhanced F1", f"{m['enhanced_f1']:.3f}",
@@ -219,7 +286,10 @@ def render_single_mode(art):
             st.warning("Type or pick a message first.")
             return
 
-        pred, proba, cleaned = predict_sentiment([text], art)
+        vader = get_vader()
+        pred_int, confidence, source, vader_compound, ml_proba, cleaned_text = hybrid_predict(text, art, vader)
+        cleaned = [cleaned_text]  # downstream functions expect a list
+
         topic_dist, dominant, raw_signal = predict_topics(cleaned, art)
         topic_id = int(dominant[0])
         topic_score = float(topic_dist[0, topic_id])
@@ -228,39 +298,79 @@ def render_single_mode(art):
         pos_words, neg_words, n_features = explain_prediction(cleaned[0], art)
         topic_words = explain_topic(cleaned[0], topic_id, art)
 
-        # ---------- Out-of-vocabulary warning ----------
-        if n_features == 0:
-            st.error(
-                "⚠️ **The model doesn't know any of these words.** "
-                "Every word in your input was below the training-frequency threshold "
-                "or didn't appear in Twitter-language training data. "
-                "The prediction below is the model's default guess, not a real analysis. "
-                "Try a longer message with common words."
+        # ---------- Hybrid engine banner — shows which engine decided ----------
+        if source == "VADER":
+            st.info(
+                f"🛟 **Lexicon safety net used.** VADER detected strong sentiment "
+                f"(compound score {vader_compound:+.2f}) and overrode the ML model. "
+                f"The ML model would have said {('positive' if ml_proba >= 0.5 else 'negative')} "
+                f"at {max(ml_proba, 1-ml_proba):.0%} confidence — but it only knows words it "
+                f"saw during training, so we trust VADER for clear-cut cases like this."
             )
-        elif n_features < 3:
+        else:
+            st.success(
+                f"🤖 **ML model used.** VADER had no strong opinion (compound {vader_compound:+.2f}), "
+                f"so the decision came from the Sentiment140-trained classifier."
+            )
+
+        # ---------- Out-of-vocabulary note (only if ML was used and no features matched) ----------
+        if source == "ML" and n_features == 0:
+            st.error(
+                "⚠️ **The ML model also doesn't know any of these words.** "
+                "VADER couldn't find clear sentiment either. The prediction below is "
+                "essentially a default guess. Try a longer message."
+            )
+        elif source == "ML" and n_features < 3:
             st.warning(
-                f"⚠️ Only {n_features} word(s) from your input are in the model's vocabulary. "
-                "The prediction has low reliability. Add more context for a better result."
+                f"Only {n_features} word(s) matched the ML vocabulary. Low reliability."
             )
 
         # ---------- Headline metrics ----------
-        sentiment_label = "Positive 😊" if pred[0] == 1 else "Negative 😟"
-        confidence = proba[0] if pred[0] == 1 else 1 - proba[0]
+        sentiment_label = "Positive 😊" if pred_int == 1 else "Negative 😟"
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Sentiment", sentiment_label)
         c2.metric("Confidence", f"{confidence:.0%}")
-        c3.metric(
+        c3.metric("Engine", source)
+        c4.metric(
             "Dominant topic",
             topic_label_for(topic_id, art),
-            delta=f"signal strength: {topic_raw:.2f}",
+            delta=f"signal: {topic_raw:.2f}",
             delta_color="off",
         )
 
-        # ---------- Explainability: why did the model predict this? ----------
+        # ---------- Engine breakdown ----------
+        with st.expander("🔬 See how each engine scored this"):
+            bc1, bc2 = st.columns(2)
+            with bc1:
+                st.markdown("**VADER (lexicon-based)**")
+                st.metric("Compound score", f"{vader_compound:+.3f}",
+                          help="Range: -1 (very negative) to +1 (very positive). |score| > 0.5 = strong.")
+                if abs(vader_compound) >= VADER_STRONG_THRESHOLD:
+                    st.caption("✅ Strong enough to decide")
+                else:
+                    st.caption("⚪ Too weak to decide alone")
+            with bc2:
+                st.markdown("**ML model (Sentiment140)**")
+                st.metric("Positive probability", f"{ml_proba:.1%}")
+                if n_features == 0:
+                    st.caption("❌ 0 words in vocabulary")
+                elif n_features < 3:
+                    st.caption(f"⚠️ Only {n_features} words in vocabulary")
+                else:
+                    st.caption(f"✅ {n_features} words in vocabulary")
+
+        # Keep the original pred variable name compatible with the rest of the function
+        pred = np.array([pred_int])
+        proba = np.array([ml_proba])  # for the explainability section below, we use ML internals
+
+        # ---------- Explainability: why did the ML model say what it said? ----------
         st.markdown("---")
-        st.markdown("### 🔍 Why the model said this")
-        st.caption("Per-word contribution: how much each word in your input pushed the prediction toward positive or negative.")
+        st.markdown("### 🔍 Why the ML model said what it said")
+        st.caption(
+            "Per-word contribution from the Sentiment140 classifier. Note: if VADER "
+            "overrode the ML model above, the final answer is based on VADER, not these words."
+        )
 
         if n_features == 0:
             st.info("No explanation available — none of your input words are in the model's vocabulary.")
@@ -388,14 +498,25 @@ def render_bulk_mode(art):
         return
 
     if st.button("Run analysis", type="primary"):
-        with st.spinner("Scoring rows..."):
+        with st.spinner("Scoring rows with VADER + ML hybrid..."):
+            vader = get_vader()
             texts = df[text_col].fillna("").astype(str).tolist()
-            pred, proba, cleaned = predict_sentiment(texts, art)
-            topic_dist, dominant, _ = predict_topics(cleaned, art)
+
+            preds, confs, sources, cleaned_list = [], [], [], []
+            for t in texts:
+                p, c, src, _, _, cl = hybrid_predict(t, art, vader)
+                preds.append(p)
+                confs.append(c)
+                sources.append(src)
+                cleaned_list.append(cl)
+
+            preds = np.array(preds)
+            topic_dist, dominant, _ = predict_topics(cleaned_list, art)
 
             df_out = df.copy()
-            df_out["sentiment"] = ["positive" if p == 1 else "negative" for p in pred]
-            df_out["confidence"] = np.where(pred == 1, proba, 1 - proba).round(3)
+            df_out["sentiment"] = ["positive" if p == 1 else "negative" for p in preds]
+            df_out["confidence"] = np.round(confs, 3)
+            df_out["engine"] = sources
             df_out["topic_id"] = dominant
             df_out["topic_label"] = [topic_label_for(int(t), art) for t in dominant]
 
@@ -411,12 +532,18 @@ def _render_bulk_dashboard(df_out, art):
     n_neg = int((df_out["sentiment"] == "negative").sum())
     pct_neg = n_neg / n if n else 0
     n_topics_seen = df_out["topic_id"].nunique()
+    n_vader = int((df_out["engine"] == "VADER").sum()) if "engine" in df_out.columns else 0
+    pct_vader = n_vader / n if n else 0
 
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Messages analyzed", f"{n:,}")
     k2.metric("Negative", f"{n_neg:,}", delta=f"{pct_neg:.1%}")
     k3.metric("Positive", f"{n - n_neg:,}", delta=f"{1 - pct_neg:.1%}")
     k4.metric("Distinct topics", n_topics_seen)
+    k5.metric("Decided by VADER", f"{n_vader:,}",
+              delta=f"{pct_vader:.0%} of rows",
+              delta_color="off",
+              help="VADER handled rows with clear lexical sentiment. The rest went to the ML model.")
 
     # Topic-level summary
     summary = (
@@ -584,9 +711,10 @@ def main():
 
     st.markdown("---")
     st.caption(
-        "Note: Sentiment140 labels were generated from emoticons, so model accuracy "
-        "with classical methods plateaus around 80%. The strength of this app is the "
-        "sentiment x topic insight layer, not raw accuracy."
+        "This app combines a rule-based lexicon (VADER) with a Sentiment140-trained "
+        "ML classifier. VADER catches formal and negated language the ML model misses; "
+        "the ML model handles the long tail of informal tweet patterns. The sentiment × "
+        "topic dashboard is where the business insight lives — not in raw accuracy."
     )
 
 
